@@ -1,0 +1,19 @@
+services:
+  reolink-image-snapshot:
+    build: .
+    image: reolink-image-snapshot:latest
+    container_name: reolink-image-snapshot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SNAPSHOT_OUTPUT_DIR: /data
+      REOLINK_PLAIN: "true"
+    volumes:
+      - ./snapshots:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "find /data -name '*.jpg' -mmin -30 | grep -q ."]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 3m

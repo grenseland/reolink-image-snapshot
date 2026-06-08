@@ -1,0 +1,22 @@
+{
+  "name": "reolink-image-snapshot",
+  "version": "1.0.0",
+  "description": "Scheduled still-image capture from Reolink cameras and Home Hubs",
+  "main": "reolink-image-snapshot.js",
+  "bin": {
+    "reolink-image-snapshot": "./reolink-image-snapshot.js"
+  },
+  "scripts": {
+    "start": "node reolink-image-snapshot.js",
+    "setup": "node setup.js"
+  },
+  "keywords": ["reolink", "camera", "snapshot", "timelapse", "home-hub", "iot"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}

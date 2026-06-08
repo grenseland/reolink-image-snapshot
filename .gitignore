@@ -1,0 +1,17 @@
+node_modules/
+.env
+.venv/
+.DS_Store
+.claude/
+
+# Runtime data (snapshots, logs, local status)
+snapshots/
+status/
+*.tsv
+*.jpg
+*.mp4
+*.tar
+
+# Local / IDE
+*.log
+dashboard.html
