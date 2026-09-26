@@ -18,6 +18,7 @@ Built for battery cameras (e.g. Argus 4 Pro on a Home Hub) where Reolink's built
 - Optionally uploads each snapshot to **S3** (or any S3-compatible store) as `latest.jpg` and/or with its timestamped filename.
 - Writes a `status.json` battery metrics file to S3 and/or a local directory after each capture.
 - Logs battery metrics to a **TSV file**.
+- Pushes battery metrics to **Grafana Cloud** (or any OpenTelemetry/OTLP backend).
 - Generates **timelapse videos** via ffmpeg on a schedule, concurrently with capture.
 - Shows a **full-screen terminal dashboard** (opt-in with `--ui`).
 
@@ -121,6 +122,37 @@ After each capture, a `status.json` is produced containing the latest battery me
 | Flag | Env var | Required | Default | Description |
 |------|---------|----------|---------|-------------|
 | `--status-dir DIR` | `REOLINK_STATUS_DIR` | No | — | Write `status.json` to this local directory after each capture |
+
+### Metrics (OpenTelemetry / Grafana Cloud)
+
+After each capture, battery readings are pushed as OTLP/HTTP JSON gauges, with no extra npm dependencies. Configuration uses the standard OpenTelemetry environment variables, so the same setup works with Grafana Cloud, an OpenTelemetry Collector, or Grafana Alloy.
+
+| Flag | Env var | Required | Default | Description |
+|------|---------|----------|---------|-------------|
+| `--otlp-endpoint URL` | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | OTLP/HTTP base URL; `/v1/metrics` is appended. Set `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` instead to give the full URL |
+| `--otlp-header K=V` | `OTEL_EXPORTER_OTLP_HEADERS` | No | — | Request headers, e.g. `Authorization=Basic%20…`. Env var takes a comma-separated list; the flag can be repeated. Values may be URL-encoded |
+| `--otlp-service-name NAME` | `OTEL_SERVICE_NAME` | No | `reolink-image-snapshot` | `service.name` resource attribute |
+
+Metrics (attributes: `service.name`, `host.name` = camera host, `channel`):
+
+| OTLP name | Unit | Source |
+|-----------|------|--------|
+| `reolink.battery.level` | `%` | Battery percent |
+| `reolink.battery.voltage` | `mV` | Battery voltage |
+| `reolink.battery.current` | `mA` | Charge current |
+| `reolink.battery.power` | `W` | Input power (voltage × current) |
+| `reolink.battery.temperature` | `Cel` | Battery temperature |
+
+Grafana converts names to Prometheus style (dots → underscores, usually with a unit suffix), so battery percent typically appears as `reolink_battery_level_percent`. Search Explore for `reolink_battery` to see the exact names.
+
+**Grafana Cloud setup:** in the Cloud portal open your stack → **OpenTelemetry → Configure**, create a token, and copy the generated endpoint and header:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-eu-west-2.grafana.net/otlp
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<base64 of instanceId:token>
+```
+
+Points are only sent when a capture happens. If your interval is longer than 5 minutes, Prometheus marks the series stale between points. Use `last_over_time(reolink_battery_level_percent[1h])` in panels, or enable *Connect null values*.
 
 ### S3 upload
 
@@ -404,6 +436,7 @@ docker compose up -d
 | Connection refused | Check hub IP and that HTTPS port 443 is reachable from the host |
 | UI not showing (`--ui` flag) | Must run in a real TTY; not available in Docker or piped output |
 | S3 `status.json` not appearing | Ensure IAM policy allows `s3:PutObject` on `arn:aws:s3:::BUCKET/*` (not just `*.jpg`) |
+| No metrics in Grafana Cloud | Look for `OTLP 401`/`OTLP 4xx` in the output. Check that the token has `metrics:write` and that the endpoint ends in `/otlp` (not `/v1/metrics` when using `OTEL_EXPORTER_OTLP_ENDPOINT`). Search Explore for `reolink_battery` |
 | Timelapse not generated | Check ffmpeg is installed and on `PATH`; look for `[timelapse:…]` lines in output |
 | `exec format error` in Docker | Image built for wrong CPU architecture — see Synology section above |
 

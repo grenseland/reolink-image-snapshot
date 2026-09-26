@@ -22,6 +22,8 @@ const DEFAULT_BATTERY_NOMINAL_V = 3.7;
 const CHARGE_EFFICIENCY     = 0.85;
 const S3_LATEST_FILENAME    = 'latest.jpg';
 const S3_STATUS_FILENAME    = 'status.json';
+const OTLP_SERVICE_NAME     = 'reolink-image-snapshot';
+const OTLP_TIMEOUT_MS       = 10_000;
 
 const CHARGE_STATUS_LABELS = {
   charging: 'Charging', chargecomplete: 'Fully charged',
@@ -179,6 +181,21 @@ function envStr(name, fallback = '') {
 function envInt(name, fallback) { return parseInt(envStr(name, String(fallback)), 10); }
 function envBool(name) { return /^(1|true|yes)$/i.test(envStr(name)); }
 
+// Parse OTLP headers in the OTEL_EXPORTER_OTLP_HEADERS format: "k1=v1,k2=v2",
+// values URL-encoded (Grafana Cloud hands out "Authorization=Basic%20…").
+function parseOtlpHeaders(str, into = {}) {
+  for (const pair of String(str || '').split(',')) {
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const key = pair.slice(0, eq).trim();
+    const raw = pair.slice(eq + 1).trim();
+    let value = raw;
+    try { value = decodeURIComponent(raw); } catch (_) {}
+    if (key) into[key] = value;
+  }
+  return into;
+}
+
 // Parse a single interval rule string "PCT:SECONDS", e.g. "50:30"
 function parseIntervalRule(str) {
   const m = str.trim().match(/^(\d+):(\d+)$/);
@@ -235,6 +252,11 @@ function parseArgs() {
     batteryLog:         envStr('REOLINK_BATTERY_LOG') || null,
     // Status JSON — can be uploaded to S3 and/or saved locally
     statusDir:          envStr('REOLINK_STATUS_DIR') || null,
+    // OpenTelemetry metrics (OTLP/HTTP JSON) — e.g. Grafana Cloud
+    otlpEndpoint:        envStr('OTEL_EXPORTER_OTLP_METRICS_ENDPOINT') || null,  // full URL incl. /v1/metrics
+    _otlpBase:           envStr('OTEL_EXPORTER_OTLP_ENDPOINT') || null,          // base URL; /v1/metrics appended
+    otlpHeaders:         parseOtlpHeaders(envStr('OTEL_EXPORTER_OTLP_HEADERS')),
+    otlpServiceName:     envStr('OTEL_SERVICE_NAME', OTLP_SERVICE_NAME),
     // S3
     s3Bucket:            envStr('REOLINK_S3_BUCKET') || null,
     s3Prefix:            envStr('REOLINK_S3_PREFIX', ''),          // global fallback prefix
@@ -280,6 +302,9 @@ function parseArgs() {
       args.intervalRules.sort((a, b) => b.minPct - a.minPct);
     }
     else if (a === '--status-dir')              args.statusDir = next();
+    else if (a === '--otlp-endpoint')           { args._otlpBase = next(); args.otlpEndpoint = null; }  // CLI overrides env
+    else if (a === '--otlp-header')             parseOtlpHeaders(next(), args.otlpHeaders);
+    else if (a === '--otlp-service-name')       args.otlpServiceName = next();
     else if (a === '--s3-bucket')               args.s3Bucket = next();
     else if (a === '--s3-prefix')               args.s3Prefix = next();
     else if (a === '--s3-snapshot-prefix')      args.s3SnapshotPrefix = next();
@@ -304,6 +329,12 @@ function parseArgs() {
   if (!args.outputDir) errors.push('--output-dir is required (or SNAPSHOT_OUTPUT_DIR / REOLINK_OUTPUT_DIR)');
   if (args.interval < 1) errors.push('--interval must be at least 1 second');
   if (!['main', 'sub'].includes(args.stream)) errors.push('--stream must be main or sub');
+
+  // Resolve the OTLP metrics URL: signal-specific endpoint wins over the base endpoint
+  if (!args.otlpEndpoint && args._otlpBase) args.otlpEndpoint = args._otlpBase.replace(/\/+$/, '') + '/v1/metrics';
+  delete args._otlpBase;
+  if (args.otlpEndpoint && !/^https?:\/\//i.test(args.otlpEndpoint))
+    errors.push('--otlp-endpoint must be an http(s) URL');
 
   // Promote individual env-var/flag shorthand into the timelapses array
   if (args._tlWindow) {
@@ -379,6 +410,19 @@ BATTERY
 
 STATUS JSON
   --status-dir DIR        Write status.json to DIR locally (REOLINK_STATUS_DIR)
+
+METRICS (OpenTelemetry / OTLP)
+  --otlp-endpoint URL        OTLP/HTTP base URL; /v1/metrics is appended
+                             (OTEL_EXPORTER_OTLP_ENDPOINT, or the full URL via
+                             OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+  --otlp-header K=V          Extra request header; repeatable      (OTEL_EXPORTER_OTLP_HEADERS=k1=v1,k2=v2)
+                             Values may be URL-encoded (Basic%20…).
+  --otlp-service-name NAME   service.name resource attribute       (OTEL_SERVICE_NAME, default: ${OTLP_SERVICE_NAME})
+
+  After each capture, battery gauges are pushed as OTLP JSON:
+  reolink.battery.level (%), .voltage (mV), .current (mA), .power (W), .temperature (Cel).
+  Grafana Cloud: use the OTLP endpoint and Authorization header from
+  your stack's "OpenTelemetry" tile.
 
 S3 UPLOAD
   --s3-bucket NAME           S3 bucket to upload to              (REOLINK_S3_BUCKET)
@@ -860,15 +904,64 @@ function appendBatteryTsv(logPath, record) {
   fs.appendFileSync(logPath, (isNew ? TSV_COLUMNS.join('\t') + '\n' : '') + row + '\n', 'utf8');
 }
 
+// ── Battery OTLP metrics ─────────────────────────────────────────────────────
+
+function otlpAttr(key, value) {
+  return { key, value: typeof value === 'number' ? { intValue: value } : { stringValue: String(value) } };
+}
+
+function buildOtlpPayload(record, battery, when, args) {
+  const timeUnixNano = String(BigInt(when.getTime()) * 1_000_000n);  // ns exceeds Number precision
+  const attributes = [otlpAttr('channel', args.channel)];
+  const temp = battery?.temperature != null ? Number(battery.temperature) : null;
+  const metrics = [
+    ['reolink.battery.level',       '%',   record.percent],
+    ['reolink.battery.voltage',     'mV',  record.voltage_mv],
+    ['reolink.battery.current',     'mA',  record.current_ma],
+    ['reolink.battery.power',       'W',   record.power_w],
+    ['reolink.battery.temperature', 'Cel', Number.isFinite(temp) ? temp : null],
+  ].filter(([, , v]) => v != null && Number.isFinite(v))
+   .map(([name, unit, v]) => ({ name, unit, gauge: { dataPoints: [{ timeUnixNano, asDouble: v, attributes }] } }));
+  if (!metrics.length) return null;
+  return {
+    resourceMetrics: [{
+      resource: { attributes: [otlpAttr('service.name', args.otlpServiceName), otlpAttr('host.name', args.host)] },
+      scopeMetrics: [{ scope: { name: OTLP_SERVICE_NAME }, metrics }],
+    }],
+  };
+}
+
+async function maybePushOtlp(record, battery, when, args) {
+  if (!args.otlpEndpoint) return null;
+  const payload = buildOtlpPayload(record, battery, when, args);
+  if (!payload) return null;
+  try {
+    const res = await fetch(args.otlpEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...args.otlpHeaders },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(OTLP_TIMEOUT_MS),
+    });
+    if (res.ok) return null;
+    const text = (await res.text().catch(() => '')).trim().slice(0, 200);
+    return `OTLP ${res.status}${text ? `: ${text}` : ''}`;
+  } catch (err) {
+    return `OTLP: ${err.message}`;
+  }
+}
+
 async function persistBatteryStatus(battery, batteryMah, when, batteryLog, args) {
   const record = buildBatteryRecord(battery, batteryMah, when);
-  const statusErr = await maybeUploadStatus(record, args);
+  const [statusErr, otlpErr] = await Promise.all([
+    maybeUploadStatus(record, args),
+    maybePushOtlp(record, battery, when, args),
+  ]);
   maybeWriteStatusLocal(record, args);
   if (batteryLog) {
     try { appendBatteryTsv(batteryLog, record); }
     catch (err) { process.stderr.write(`Battery log error (${batteryLog}): ${err.message}\n`); }
   }
-  return statusErr;
+  return [statusErr, otlpErr].filter(Boolean).join('; ') || null;
 }
 
 function saveDetail(uploadErr, statusErr, args, filename) {
@@ -879,6 +972,7 @@ function saveDetail(uploadErr, statusErr, args, filename) {
     if (args.s3UploadStatus)      items.push(S3_STATUS_FILENAME);
   }
   if (args.statusDir) items.push(`${S3_STATUS_FILENAME} (local)`);
+  if (args.otlpEndpoint) items.push('metrics (OTLP)');
 
   const errs = [uploadErr, statusErr].filter(Boolean);
   if (errs.length) return `saved, error: ${errs.join('; ')}`;
@@ -1509,7 +1603,7 @@ async function runLoop(client, args, outputDir, ui = null) {
       if (ui) {
         ui.addSnapshot({ when, filename: savedRelPath, sizeBytes: image.length, ok: true, detail });
       } else {
-        const hasMeta = args.s3Bucket || args.statusDir || uploadErr || statusErr;
+        const hasMeta = args.s3Bucket || args.statusDir || args.otlpEndpoint || uploadErr || statusErr;
         process.stdout.write(`${fmtDatetime(when)}  Saved ${image.length} bytes → ${savedRelPath}${hasMeta ? ` (${detail})` : ''}\n`);
       }
     }
@@ -1520,7 +1614,7 @@ async function runLoop(client, args, outputDir, ui = null) {
       const batLine = battery
         ? batteryDetailLines(battery, args.batteryMah, tracker).join(' | ')
         : 'Battery: not available';
-      const extra = statusErr ? ` | S3 status.json error: ${statusErr}` : '';
+      const extra = statusErr ? ` | Status error: ${statusErr}` : '';
       process.stdout.write(`${fmtDatetime(statusAt)}  ${batLine}${extra}\n`);
     }
 
@@ -1563,6 +1657,8 @@ async function main() {
   }
   if (args.statusDir)
     process.stdout.write(`Status JSON: writing to ${path.resolve(args.statusDir)}/${S3_STATUS_FILENAME}\n`);
+  if (args.otlpEndpoint)
+    process.stdout.write(`OTLP metrics: pushing battery gauges to ${args.otlpEndpoint}\n`);
 
   const client = new ReolinkClient(args.host, args.username, args.password, args.port);
   let ui = null;
